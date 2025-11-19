@@ -118,6 +118,17 @@ func analyzeCall(call *ssa.Call) {
 }
 ```
 
+### Real-World Use Case: Taint Analysis
+
+One of the most powerful applications of SSA is **taint analysis**. This involves tracking "tainted" data (e.g., user input) as it flows through the program to ensure it doesn't reach sensitive sinks (e.g., SQL execution) without being sanitized.
+
+In SSA, this becomes a graph traversal problem:
+1.  **Source:** Identify instructions that introduce tainted data (e.g., `http.Request.FormValue`).
+2.  **Propagation:** Follow the def-use chains. If `x` is tainted and `y = x + 1`, then `y` is also tainted.
+3.  **Sink:** Check if any tainted value reaches a dangerous function (e.g., `sql.Exec`).
+
+Because SSA handles control flow merges (via Phi nodes) and variable versioning, you don't need to manually track complex branching logic. The graph structure does the heavy lifting for you.
+
 ## The Trade-off
 
 While powerful, SSA is more expensive to compute than the AST. It requires full type checking, which can be slow for large codebases. It also has a steeper learning curve.
