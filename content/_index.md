@@ -9,14 +9,14 @@ I'm Nick, and this is where I share my thoughts on software engineering, testing
 ## Latest Posts
 
 {{< cards >}}
-  {{< card link="blog/251119_ssa-in-go-linters" title="Deep Dive: SSA in Go Linters" icon="code" >}}
-  {{< card link="blog/251119_improving-test-suite-generation-with-ml" title="Improving Test Suite Generation with ML" icon="sparkles" >}}
-  {{< card link="blog" title="All Posts" icon="book-open" >}}
+  {{< card link="blog/251119_ssa-in-go-linters/" title="Deep Dive: SSA in Go Linters" icon="code" >}}
+  {{< card link="blog/251119_improving-test-suite-generation-with-ml/" title="Improving Test Suite Generation with ML" icon="sparkles" >}}
+  {{< card link="blog/" title="All Posts" icon="book-open" >}}
 {{< /cards >}}
 
 ## Explore
 
 {{< cards >}}
-  {{< card link="about" title="About Me" icon="user" >}}
+  {{< card link="about/" title="About Me" icon="user" >}}
   {{< card link="https://github.com/nick-we" title="GitHub Projects" icon="github" >}}
 {{< /cards >}}

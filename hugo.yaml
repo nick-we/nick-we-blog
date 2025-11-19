@@ -19,10 +19,10 @@ markup:
 menu:
   main:
     - name: Blog
-      pageRef: /blog
+      url: /blog/
       weight: 1
     - name: About
-      pageRef: /about
+      url: /about/
       weight: 2
     - name: Contact ↗
       url: "https://github.com/nick-we"
