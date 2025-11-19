@@ -1,5 +1,5 @@
 # Hugo configuration file
-title: My Site
+title: nick-we.com
 
 # import hextra as module
 module:
@@ -18,14 +18,14 @@ markup:
 
 menu:
   main:
-    - name: Docs
-      pageRef: /docs
+    - name: Blog
+      pageRef: /blog
       weight: 1
     - name: About
       pageRef: /about
       weight: 2
     - name: Contact ↗
-      url: "https://github.com/imfing"
+      url: "https://github.com/nick-we"
       weight: 3
     - name: Search
       weight: 4
@@ -33,24 +33,49 @@ menu:
         type: search
     - name: GitHub
       weight: 5
-      url: "https://github.com/imfing/hextra-starter-template"
+      url: "https://github.com/nick-we"
       params:
         icon: github
-    - name: Twitter
+    - name: Theme Toggle
       weight: 6
-      url: "https://twitter.com/"
       params:
-        icon: x-twitter
+        type: theme-toggle
+        label: true # optional, default is false
+
+enableGitInfo: true
 
 params:
+  comments:
+    enable: true
+    type: giscus
+
+    giscus:
+      repo: nick-we/nick-we-blog
+      repoId: R_kgDOQYuoIQ
+      category: Announcements
+      categoryId: DIC_kwDOQYuoIc4Cx9mz
+
+  externalLinkDecoration: true
+
+  blog:
+    list:
+      displayTags: true
+  toc:
+    displayTags: true
+
+  # Display the last modification date
+  displayUpdatedDate: true
+  dateFormat: "January 2, 2006"
+
+  theme:
+    # light | dark | system
+    default: dark
+    displayToggle: true
+
   navbar:
     displayTitle: true
     displayLogo: false
 
   footer:
     displayCopyright: false
-    displayPoweredBy: true
-
-  editURL:
-    enable: true
-    base: "https://github.com/imfing/hextra-starter-template/edit/main/content"
+    displayPoweredBy: false

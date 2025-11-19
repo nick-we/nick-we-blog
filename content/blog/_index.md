@@ -1,9 +1,12 @@
 ---
-title: Documentation
-next: first-page
+title: Blog
+cascade:
+    type: blog
+    params:
+        reversePagination: false
 ---
 
-This is a demo of the theme's documentation layout.
+This is a demo of the theme's blog layout.
 
 ## Hello, World!
 
