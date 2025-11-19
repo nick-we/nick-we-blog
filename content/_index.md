@@ -1,16 +1,16 @@
 ---
-title: Home
+title: Welcome
 toc: false
 ---
 
-# Welcome
-
+<br/><br/>
 I'm Nick, and this is where I share my thoughts on software engineering, testing, and technology.
 
 ## Latest Posts
 
 {{< cards >}}
-  {{< card link="blog/improving-test-suite-generation-with-ml" title="Improving Test Suite Generation with ML" icon="sparkles" >}}
+  {{< card link="blog/251119_ssa-in-go-linters" title="Deep Dive: SSA in Go Linters" icon="code" >}}
+  {{< card link="blog/251119_improving-test-suite-generation-with-ml" title="Improving Test Suite Generation with ML" icon="sparkles" >}}
   {{< card link="blog" title="All Posts" icon="book-open" >}}
 {{< /cards >}}
 
