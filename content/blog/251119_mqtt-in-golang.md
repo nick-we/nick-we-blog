@@ -1,3 +1,10 @@
+---
+title: "The Architect’s Guide to MQTT in Golang: High-Performance IoT Messaging"
+date: 2025-11-19
+description: "A deep dive into architecting scalable, production-grade IoT pipelines using Golang and MQTT 5.0, focusing on concurrency patterns, resilience, and performance tuning."
+tags: ["Golang", "MQTT", "IoT Architecture", "Distributed Systems", "Backend Development"]
+---
+
 # The Architect’s Guide to MQTT in Golang: High-Performance IoT Messaging
 
 Why do 60% of enterprise IoT projects stall before they ever reach production scale?
