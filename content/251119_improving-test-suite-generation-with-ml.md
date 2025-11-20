@@ -2,6 +2,9 @@
 title: "Improving Test Suite Generation with Machine Learning"
 date: 2025-11-19
 description: "Exploring how machine learning can optimize boundary value analysis for better software testing."
+draft: false
+params:
+  author: Nick Westendorf
 tags: ["testing", "machine learning", "software engineering", "research"]
 ---
 

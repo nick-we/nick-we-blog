@@ -2,9 +2,11 @@
 title: "The Architect’s Guide to MQTT in Golang: High-Performance IoT Messaging"
 date: 2025-11-20
 description: "A deep dive into architecting scalable, production-grade IoT pipelines using Golang and MQTT 5.0, focusing on concurrency patterns, resilience, and performance tuning."
+draft: false
+params:
+  author: Nick Westendorf
 tags: ["Golang", "MQTT", "IoT Architecture", "Distributed Systems", "Backend Development"]
 ---
-
 Why do 60% of enterprise IoT projects stall before they ever reach production scale?
 
 It is rarely a hardware failure. The sensors work. The gateways boot up. The cellular modems connect. The failure almost always happens in the architectural "middle mile"—the invisible layer where massive streams of concurrent data meet the rigid constraints of backend infrastructure.
@@ -430,4 +432,6 @@ This separation of concerns: *Ingestion (Sync/Fast)* vs. *Processing (Async/Slow
 
 ## Section 4: Advanced Message Delivery (QoS & Retention)
 
-*(TODO: nick-we / to be continued)*
+In HTTP-based architectures, a successful "200 OK" response usually implies the data has been processed. In MQTT, the act of publishing is decoupled from the act of delivery. You might successfully push a message to the broker, but if the target device is in a tunnel or sleeping to save battery, that message is in limbo.
+
+As a Go architect, you are not just moving bytes; you are managing the guarantees of data consistency. This section explores the mechanisms MQTT provides to negotiate this reliability and how to implement them using the Paho Go library without shooting your throughput in the foot.

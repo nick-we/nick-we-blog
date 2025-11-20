@@ -1,5 +1,7 @@
 # Hugo configuration file
-title: nick-we
+baseURL: "https://nick-we.com/"
+title: Nick Westendorf - Blog
+description: Hi I'm Nick Westendorf, and this is where I share my thoughts on software engineering and technology.
 
 # import hextra as module
 module:
@@ -18,34 +20,28 @@ markup:
 
 menu:
   main:
-    - name: Blog
-      url: /blog/
+    - name: GitHub
       weight: 1
-    - name: About
-      url: /about/
-      weight: 2
-    - name: Contact ↗
       url: "https://github.com/nick-we"
-      weight: 3
+    - name: Contact ↗
+      weight: 2
+      url: "mailto:mail@nick-we.com"
     - name: Search
-      weight: 4
+      weight: 3
       params:
         type: search
-    - name: GitHub
-      weight: 5
-      url: "https://github.com/nick-we"
-      params:
-        icon: github
     - name: Theme Toggle
-      weight: 6
+      weight: 4
       params:
         type: theme-toggle
-        label: true # optional, default is false
 
+enableRobotsTXT: true
 enableGitInfo: true
 enableInlineShortcodes: true
 
 params:
+  description: Hi I'm Nick Westendorf, and this is where I share my thoughts on software engineering and technology.
+
   comments:
     enable: true
     type: giscus
@@ -61,6 +57,15 @@ params:
   blog:
     list:
       displayTags: true
+      # date | lastmod | publishDate | title | weight
+      sortBy: date
+      sortOrder: desc # or "asc"
+      # Pagination
+      pagerSize: 20
+
+    article:
+      displayPagination: true
+  
   toc:
     displayTags: true
 
@@ -74,9 +79,32 @@ params:
     displayToggle: true
 
   navbar:
-    displayTitle: true
-    displayLogo: false
+    displayTitle: false
+    displayLogo: true
+    logo:
+      path: images/logo.svg
+      dark: images/logo-dark.svg
+      link: /
+      width: 40
+      height: 40
 
   footer:
-    displayCopyright: false
+    enable: true
+    displayCopyright: true
     displayPoweredBy: false
+    width: normal
+
+  search:
+    enable: true
+    type: flexsearch
+
+  flexsearch:
+    # index page by: content | summary | heading | title
+    index: content
+    # full | forward | reverse | strict
+    # https://github.com/nextapps-de/flexsearch/#tokenizer-prefix-search
+    tokenize: forward
+
+  page:
+    # full (100%), wide (90rem), normal (80rem)
+    width: normal
