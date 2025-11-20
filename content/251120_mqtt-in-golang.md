@@ -6,6 +6,8 @@ draft: false
 params:
   author: Nick Westendorf
 tags: ["Golang", "MQTT", "IoT Architecture", "Distributed Systems", "Backend Development"]
+sidebar:
+  exclude: true
 ---
 Why do 60% of enterprise IoT projects stall before they ever reach production scale?
 

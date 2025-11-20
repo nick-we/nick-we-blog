@@ -26,6 +26,8 @@ menu:
     - name: Contact ↗
       weight: 2
       url: "mailto:mail@nick-we.com"
+      params:
+        type: mail
     - name: Search
       weight: 3
       params:
@@ -34,6 +36,16 @@ menu:
       weight: 4
       params:
         type: theme-toggle
+
+  sidebar:
+    - name: GitHub
+      weight: 1
+      url: "https://github.com/nick-we"
+    - name: Contact ↗
+      weight: 2
+      url: "mailto:mail@nick-we.com"
+      params:
+        type: mail
 
 enableRobotsTXT: true
 enableGitInfo: true
