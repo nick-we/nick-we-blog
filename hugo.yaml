@@ -43,6 +43,7 @@ menu:
         label: true # optional, default is false
 
 enableGitInfo: true
+enableInlineShortcodes: true
 
 params:
   comments:

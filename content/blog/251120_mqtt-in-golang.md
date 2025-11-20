@@ -83,7 +83,9 @@ In Node.js, you are bound by the single-threaded Event Loop. While efficient for
 
 Go solves this with Goroutines. Go uses an M:N scheduler, multiplexing thousands of Goroutines onto a small number of OS threads. A Goroutine starts with a mere 2KB of stack space. This means a modest Go microservice can maintain tens of thousands of concurrent MQTT connections (or topic handlers) without exhausting system memory.
 
+{{< callout type="info" >}}
 Architectural Note: When an MQTT message arrives, Go can spawn a Goroutine to handle the business logic (DB writes, parsing) instantly. If that logic blocks (e.g., waiting for a slow database), the Go runtime simply parks that Goroutine and executes another, keeping the CPU saturated and the throughput high. Benchmarks consistently show Go executing **~2.6x faster** than Node.js in these CPU-bound, high-concurrency scenarios.
+{{< /callout >}}
 
 #### 2. Deployment and The "Deep Edge"
 
@@ -237,4 +239,195 @@ By establishing this environment—an isolated local broker, deep introspection 
 
 ## Section 3: Core Implementation & Connection Lifecycle
 
-(TODO: nick-we)
+Now we move from theory to the metal. In this section, we will implement the core connectivity layer.
+
+Most tutorials show you how to connect. As architects, our job is to ensure the system stays connected and recovers gracefully when it doesn't. We will avoid the standard `eclipse/paho.mqtt.golang` (v3) library in favor of the modern `eclipse/paho.golang` (v5), specifically leveraging its autopaho sub-package to handle the reconnection loop automatically.
+
+### 3.1. The Client Options Struct
+
+In MQTT 5.0, the "Clean Session" flag has been split into two distinct concepts: Clean Start and Session Expiry. This is the most critical configuration for production reliability.
+
+- Clean Start (`true`): The broker discards any previous session data for this ClientID immediately upon connection.
+- Clean Start (`false`) + Session Expiry: The broker resumes your session (delivering queued messages) if you reconnect within the expiry window.
+
+We will create a `ClientConfig` struct that acts as our single source of truth.
+
+```go
+package mqttclient
+
+import (
+	"context"
+	"net/url"
+	"time"
+
+	"github.com/eclipse/paho.golang/autopaho"
+	"github.com/eclipse/paho.golang/paho"
+)
+
+// BrokerConfig holds the infrastructure details
+type BrokerConfig struct {
+	ServerURL   string
+	ClientID    string
+	Username    string
+	Password    string
+	KeepAlive   uint16 // Seconds, e.g., 60
+	SessionExpiry uint32 // Seconds, e.g., 3600 (1 hour)
+}
+
+// NewConnectionManager initializes the autopaho manager
+func NewConnectionManager(ctx context.Context, cfg BrokerConfig) (*autopaho.ConnectionManager, error) {
+	u, err := url.Parse(cfg.ServerURL)
+	if err != nil {
+		return nil, err
+	}
+
+	// Define the MQTT 5.0 Client Configuration
+	cliCfg := autopaho.ClientConfig{
+		ServerUrls: []*url.URL{u},
+		KeepAlive:  cfg.KeepAlive, 
+		// CleanStart: false enables persistent sessions (if SessionExpiry > 0)
+		CleanStartOnInitialConnection: false, 
+		SessionExpiryInterval:         cfg.SessionExpiry, 
+		
+		// Credentials
+		ConnectUsername: cfg.Username,
+		ConnectPassword: []byte(cfg.Password),
+		
+		// Resiliency: Exponential Backoff for Reconnection
+		ReconnectDelay: func(attempt int) time.Duration {
+            // Cap max delay at 30s to prevent excessive downtime
+            delay := time.Duration(attempt) * 2 * time.Second
+            if delay > 30*time.Second {
+                return 30 * time.Second
+            }
+            return delay
+        },
+
+		// Handler for when the connection comes UP
+		OnConnectionUp: func(cm *autopaho.ConnectionManager, connAck *paho.Connack) {
+			// Re-subscribe logic goes here (if not using persistent sessions)
+			// or logging the successful handshake
+		},
+		
+		// Handler for when the connection goes DOWN
+		OnConnectionError: func(err error) {
+			// Log this to your observability stack (Zap/Logrus)
+		},
+		
+		// The "Router": How we handle incoming messages
+		ClientConfig: paho.ClientConfig{
+			ClientID: cfg.ClientID,
+			// Critical: Register the global router (see 3.3)
+			OnPublishReceived: []func(paho.PublishReceived) (bool, error){
+				globalRouter, 
+			},
+			OnClientError: func(err error) {
+				// Handle internal library errors
+			},
+		},
+	}
+	// autopaho handles the connection loop for us
+	return autopaho.NewConnection(ctx, cliCfg)
+}
+```
+
+{{< callout type="info" >}}
+Architectural Note: Notice we use `autopaho`. In the v3 library, you had to write your own `for { connect(); time.Sleep() }` loop. `autopaho` handles this robustly, including the "Session Present" flag checks.
+{{< /callout >}}
+
+### 3.2. Publishing Data: Types and Serialization
+
+A common mistake in Go IoT apps is tight coupling between the transport layer and the payload structure.
+
+**The Payload Strategy: JSON vs. Protobuf**
+- **JSON**: Human-readable, easy to debug with MQTT Explorer.
+  - *Cost*: Heavy on the CPU (reflection) and network (text verbose).
+  - *Use Case*: Config updates, infrequent telemetry.
+- **Protocol Buffers (Protobuf)**: Binary Serialization
+  - *Benefit*: 10x smaller payloads, strictly typed, faster serialization.
+  - *Use Case*: High-frequency sensor data (10Hz+).
+  
+For this guide, we assume a mixed strategy: JSON for metadata/control, Protobuf for high-volume telemetry.
+
+**The Async Publish Pattern**: Do not block your main thread waiting for an MQTT ACK.
+
+```go
+func PublishTelemetry(ctx context.Context, cm *autopaho.ConnectionManager, topic string, payload []byte) error {
+  // Create the Publish packet
+  pubPacket := &paho.Publish{
+    Topic:   topic,
+    Payload: payload,
+    QoS:     1, // At Least Once
+    // MQTT 5.0 Properties
+    Properties: &paho.PublishProperties{
+      ContentType: "application/octet-stream", // or "application/json"
+      User: []paho.UserProperty{
+        {Key: "trace_id", Value: "abc-123"}, // OpenTelemetry Injection
+      },
+    },
+  }
+
+  // Publish blocks ONLY until the packet is written to the wire, 
+  // not until the ACK is received (unless configured otherwise).
+  // For ultra-high throughput, use an internal buffer instead of calling this directly.
+  _, err := cm.Publish(ctx, pubPacket)
+  return err
+}
+```
+
+### 3.3. Subscribing and Routing
+
+This is where the "Paho Deadlock" happens.
+
+**The Fatal Flaw**: If you execute long-running logic (like a DB write or an HTTP call) inside the OnPublishReceived callback, you block the client's internal read loop. If the client needs to send a PING or receive an ACK while you are blocked, the connection will time out and drop.
+
+**The Solution: The "Ingestion Valve" Pattern** The callback must do exactly one thing: push the message to a buffered channel and return immediately.
+
+```go
+// 1. Create a buffered channel to decouple ingestion from processing
+var messageQueue = make(chan *paho.Publish, 1000)
+
+// 2. The Global Router (The "Valve")
+// This function is registered in ClientConfig.OnPublishReceived
+func globalRouter(pr paho.PublishReceived) (bool, error) {
+	// NON-BLOCKING PUSH
+	select {
+	case messageQueue <- pr.Packet:
+		// Success
+	default:
+		// Buffer is full: Drop the message or log an error. 
+		// DO NOT BLOCK here, or you risk the deadlock.
+		// Log: "WARNING: Ingestion queue full, dropping message"
+	}
+	return true, nil // true = acknowledge receipt to the library
+}
+
+// 3. The Processor (Running in a separate Goroutine)
+func StartProcessor(ctx context.Context) {
+	for {
+		select {
+		case msg := <-messageQueue:
+			// Route based on Topic
+			switch {
+			case matchTopic("sensors/+/temp", msg.Topic):
+				handleTemp(msg)
+			case matchTopic("commands/#", msg.Topic):
+				handleCommand(msg)
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+```
+
+This separation of concerns: *Ingestion (Sync/Fast)* vs. *Processing (Async/Slow)* is the single most important factor in building a stable Go MQTT client.
+
+#### Summary of Core Implementation
+1. Use `autopaho`: Let the library manage the reconnection exponential backoff.
+2. Config `CleanStart: false`: Enable session persistence for robustness.
+3. Never Block the Handler: Use a buffered channel as a shock absorber between the network and your logic.
+
+## Section 4: Advanced Message Delivery (QoS & Retention)
+
+*(TODO: nick-we / to be continued)*
