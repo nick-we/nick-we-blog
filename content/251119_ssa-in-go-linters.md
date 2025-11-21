@@ -6,8 +6,6 @@ draft: false
 params:
   author: Nick Westendorf
 tags: ["go", "golang", "static analysis", "ssa", "compilers"]
-sidebar:
-  exclude: true
 ---
 
 When writing custom linters or static analysis tools for Go, you often start with the Abstract Syntax Tree (AST). The AST is great for syntax-level checks—like ensuring variable names follow a convention or checking for missing comments. However, when you need to understand the *behavior* of the code—data flow, control flow, or value propagation the AST becomes cumbersome.
