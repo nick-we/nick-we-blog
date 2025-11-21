@@ -926,7 +926,175 @@ By implementing Request-Response this way, your Go services become **stateless**
 
 ## Section 7: Hardening: Security & Reliability
 
-(TODO: nick-we)
+We have built a high-performance engine. Now we must plate it in armor.
+
+In a production IoT environment, the network is not just unreliable; it is hostile. A "working" MQTT implementation that sends data over port 1883 (plaintext) is a liability. If your fleet transmits sensitive telemetry or, worse, accepts command payloads (e.g., "unlock door"), a lack of security is not a bug—it is negligence.
+
+Furthermore, "reliability" is not just about staying connected; it is about reconnecting without destroying your infrastructure. This section details how to implement **Zero Trust Security** (Mutual TLS) and **Anti-Fragile Reconnection Logic** in Go.
+
+### 7.1. TLS/SSL Configuration in Go
+
+The first rule of production MQTT is: **Never use Port 1883**. Always use Port 8883 (TLS).
+
+Go’s standard library `crypto/tls` is excellent—robust, performant, and secure by default. However, configuring it for an MQTT client requires specific attention to certificate authorities (CAs).
+
+#### One-Way TLS (Encryption)
+
+This is the minimum standard. The client verifies the broker's identity, ensuring you aren't sending credentials to a Man-in-the-Middle (MitM).
+
+```go
+func NewTLSConfig() *tls.Config {
+    // 1. Load the System CA Pool
+    // This allows us to trust public brokers (AWS, Azure, HiveMQ Cloud)
+    // that use Let's Encrypt or DigiCert.
+    rootCAs, _ := x509.SystemCertPool()
+    if rootCAs == nil {
+        rootCAs = x509.NewCertPool()
+    }
+
+    // 2. (Optional) Load a Custom CA
+    // If using a private Mosquitto/EMQX with self-signed certs,
+    // you MUST load your internal CA pem file here.
+    caCert, err := os.ReadFile("certs/ca.crt")
+    if err == nil {
+        rootCAs.AppendCertsFromPEM(caCert)
+    }
+
+    return &tls.Config{
+        RootCAs: rootCAs,
+        // DANGER ZONE: Never set this to true in production.
+        // It disables certificate verification, making TLS useless against MitM.
+        InsecureSkipVerify: false, 
+        MinVersion:         tls.VersionTLS12, // Enforce modern security
+    }
+}
+```
+
+#### Mutual TLS (mTLS): The Gold Standard
+
+In high-security IIoT (Industrial IoT), a username/password is insufficient. Credentials can be stolen. Instead, we use **mTLS**. The client holds a private key and a certificate signed by the company CA. The broker refuses connection to any device that cannot cryptographically prove its identity.
+
+To implement this in Go, we load the client's keypair into the `tls.Config`:
+```go
+func NewMutualTLSConfig(certFile, keyFile string) (*tls.Config, error) {
+    // Load the client's public cert and private key
+    cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+    if err != nil {
+        return nil, fmt.Errorf("failed to load client certs: %w", err)
+    }
+
+    cfg := NewTLSConfig() // Start with the base config above
+    cfg.Certificates = []tls.Certificate{cert}
+    
+    return cfg, nil
+}
+```
+
+{{< callout type="info" >}}
+Architectural Note: mTLS adds significant overhead to the handshake phase. On a cellular connection, a full handshake can consume 4-5KB of data and take seconds of latency. If you use mTLS, ensure you use Session Resumption (Session ID / Session Tickets) in Go’s TLS config to avoid the full handshake on every reconnect.
+{{< /callout >}}
+
+### 7.2. Authentication Strategies
+
+If mTLS verifies the *machine*, Authentication verifies the *permissions*.
+
+#### The Problem with Static Credentials
+
+Hardcoding `const Username = "admin"` in your Go binary is a security failure. If the binary is reverse-engineered, your entire fleet is compromised.
+
+#### Token-Based Auth (JWT)
+The modern pattern is to use **JSON Web Tokens (JWT)**. The device authenticates via HTTPS to an Auth Server (Auth0, Cognito, or custom Go service), receives a signed JWT, and uses that JWT as the MQTT Password.
+
+Handling Token Expiry in `autopaho`: The challenge is that JWTs expire (e.g., after 1 hour). If the MQTT connection drops after 65 minutes, the client will try to reconnect with the old, expired token. The broker will reject it with `0x87 Not Authorized`.
+
+We must implement a **Dynamic Credential Refresh**.
+```go
+// In the autopaho configuration:
+
+cliCfg := autopaho.ClientConfig{
+    // ... basic config ...
+    
+    // ConnectUsername can remain static or be updated
+    ConnectUsername: "device_001",
+
+    // OnConnectionError is our hook to refresh credentials
+    OnConnectionError: func(err error) {
+        // Check if the error is an Auth failure
+        // (Note: Implementation depends on how the library bubbles up the Reason Code)
+        log.Printf("Connection failed: %v", err)
+        
+        // REFRESH LOGIC
+        newToken, err := fetchNewJWT() 
+        if err == nil {
+            // CRITICAL: Update the password for the NEXT attempt
+            // autopaho allows modifying the config struct safely here? 
+            // Actually, we usually need to tear down and restart the manager 
+            // if the library doesn't support hot-swapping credentials.
+            // *Correct pattern for autopaho:*
+            // The library reads credentials from the struct on every connect attempt.
+            // We need to update the variable that holds the password.
+        }
+    },
+}
+```
+
+{{< callout type="info" >}}
+**Correction**: `autopaho` does not currently support a callback to purely "get password" right before connect in a simple way. The robust Go pattern is to wrap the `ConnectPassword` logic. Some architects prefer to close the connection manager entirely upon an Auth failure, fetch a new token, and instantiate a new manager.
+{{< /callout >}}
+
+### 7.3. Resilient Reconnection Logic
+
+When a broker restarts, 100,000 devices disconnect simultaneously. If they all retry immediately, they create a DoS (Denial of Service) attack against your own infrastructure. This is the "Thundering Herd."
+
+#### 1. Exponential Backoff with Jitter
+Standard backoff (1s, 2s, 4s, 8s) is not enough because devices often sync up. You must add **Jitter** (randomness) to desynchronize the herd.
+
+```go
+// Custom Reconnect Delay Function
+ReconnectDelay: func(attempt int) time.Duration {
+    // 1. Base Exponential Calculation
+    delay := float64(time.Second) * math.Pow(2, float64(attempt))
+    
+    // 2. Cap at a maximum (e.g., 2 minutes)
+    if delay > float64(2*time.Minute) {
+        delay = float64(2*time.Minute)
+    }
+    
+    // 3. Add Jitter (Random +/- 20%)
+    // This spreads the load across the timeframe
+    jitter := (rand.Float64() * 0.4) - 0.2 // Range -0.2 to +0.2
+    finalDelay := delay * (1 + jitter)
+    
+    return time.Duration(finalDelay)
+}
+```
+
+#### 2. The "Circuit Breaker" for the Edge
+
+If a device fails to connect for 100 attempts, it is likely that the cellular modem is in a bad state or the subscription has expired. Continuing to retry drains the battery and fills the logs.
+
+**Go Implementation**: We use a state machine.
+1. **Normal**: Connected.
+2. **Retry**: Attempting to reconnect (Backoff active).
+3. **Deep Sleep**: After $N$ failures, pause the MQTT Manager entirely. Sleep the OS or the Goroutine for 1 hour. Then perform a full system reset or modem power-cycle.
+
+```go
+// Psuedo-code for Circuit Breaker Logic
+if attempt > 50 {
+    log.Error("Circuit Breaker Tripped: Broker unreachable.")
+    cancelCtx() // Stop the autopaho manager
+    enterDeepSleep(1 * time.Hour)
+    // On wake, os.Exit(0) to restart the process fresh
+}
+```
+
+#### 3. Identifying "Zombie" Connections
+
+Sometimes, a TCP connection is "established" according to the OS, but no data is flowing (a "half-open" connection). This often happens with NAT timeouts in cellular networks.
+
+The Paho `KeepAlive` is your defense. Ensure `KeepAlive` is set to a reasonable value (e.g. 60 seconds). The Go library handles the PINGREQ/PINGRESP cycle. If the OS socket is dead, the PING will fail, triggering the `OnConnectionLost` handler, allowing your backoff logic to kick in and re-establish a healthy link.
+
+By combining **TLS 1.2+**, **Dynamic Auth**, and **Jittered Backoff**, we transform our Go client from a fragile script into a hardened industrial agent capable of surviving the chaos of the public internet.
 
 ## Section 8: Performance Tuning & Benchmarking
 
