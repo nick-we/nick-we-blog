@@ -1,5 +1,5 @@
 ---
-title: "Deep Dive: Static Single Assignment (SSA) in Go Linters"
+title: "Short Introduction: Static Single Assignment (SSA) in Go Linters"
 date: 2025-11-19
 description: "Understanding how SSA form powers advanced static analysis and custom linters in Go."
 draft: false
