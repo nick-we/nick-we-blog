@@ -742,7 +742,187 @@ By combining **Buffered Channels** for ingestion, **Worker Pools** for throughpu
 
 ## Section 6: MQTT 5.0 Features in Go
 
-(TODO: nick-we)
+For over a decade, MQTT 3.1.1 was the bedrock of IoT. It was simple, reliable, and extremely limited. If you wanted to load balance consumers, you needed Kafka. If you wanted to add metadata (like tracing headers), you had to pollute your JSON payload. If you wanted a reply to a message, you had to invent your own complex routing convention.
+
+MQTT 5.0 changed the game by absorbing these application-layer patterns into the protocol itself. For the Golang architect, this is a paradigm shift. It allows us to delete thousands of lines of "glue code" and rely on standard protocol features.
+
+This section demonstrates how to implement the three most transformative MQTT 5.0 features using the `eclipse/paho.golang` library.
+
+### 6.1. Shared Subscriptions (Client Load Balancing)
+
+In a traditional Pub/Sub model, if you scale your backend Go service to 10 replicas (Pods) in Kubernetes, and they all subscribe to `factory/warnings`, the broker sends a copy of every message to all 10 replicas.
+
+This is "Fan-Out," which is great for caching but catastrophic for job processing. If the message triggers a database write or an email alert, you will write the same row 10 times or send 10 duplicate emails.
+
+#### The Old Solution vs. The MQTT 5.0 Solution
+
+Previously, architects solved this by placing an external queue (RabbitMQ/Kafka) behind the MQTT consumer. The Go app would dump MQTT messages into Kafka, and a separate worker group would consume from Kafka. This added latency and operational complexity.
+
+**Shared Subscriptions** solve this natively. By using a special topic prefix, the broker creates a "Consumer Group" and round-robins the messages among the members of that group.
+
+#### Implementation in Go
+
+The beauty of Shared Subscriptions in Go is that they require zero logic changes to your message handler. The magic is entirely in the subscription string.
+
+The syntax is: `$share/<GroupID>/<TopicFilter>`
+
+```go
+func SubscribeToWorkerGroup(ctx context.Context, cm *autopaho.ConnectionManager) error {
+    // Define the Topic.
+    // GroupID: "backend-processors" (All clients using this ID share the load)
+    // Topic:   "sensors/+/temp"     (The actual data we want)
+    topic := "$share/backend-processors/sensors/+/temp"
+
+    // The subscription packet looks standard
+    _, err := cm.Subscribe(ctx, &paho.Subscribe{
+        Subscriptions: map[string]paho.SubscribeOptions{
+            topic: {QoS: 1},
+        },
+    })
+    
+    if err != nil {
+        return fmt.Errorf("failed to join shared group: %w", err)
+    }
+    
+    log.Printf("Joined Shared Group 'backend-processors' on topic: %s", topic)
+    return nil
+}
+```
+
+{{< callout type="info" >}}
+Architectural Note: If you have 50 Go replicas, they act as a single logical consumer. If one replica crashes (or is rolling updated), the broker detects the disconnect and immediately re-routes its portion of the traffic to the remaining 49 replicas. This eliminates the need for a separate "Work Queue" component in your infrastructure.
+{{< /callout >}}
+
+### 6.2. User Properties (Metadata Headers)
+
+In MQTT 3.1.1, the payload was a black box. If you wanted to include a **Trace ID** for OpenTelemetry, a **Schema Version**, or the **Device Type**, you had to embed it inside the JSON body:
+```json
+// Old Way:
+{"data": 25.5, "trace_id": "abc", "version": "1.0"}
+```
+
+This meant every consumer had to parse the JSON just to route the message, wasting CPU cycles. It also broke binary formats like Protobuf, which don't allow arbitrary fields.
+
+MQTT 5.0 introduces **User Properties**: Key-Value string pairs that live in the packet header, outside the payload. This is exactly like HTTP Headers.
+
+#### Use Case: OpenTelemetry Injection
+
+We can inject a W3C Trace Context into the MQTT header, allowing us to trace a request from the Edge Device -> Broker -> Go Service -> Database, viewing the entire span in Jaeger or Datadog.
+
+#### Writing Properties (The Publisher)
+```go
+func PublishWithTrace(ctx context.Context, cm *autopaho.ConnectionManager, topic string, payload []byte) {
+    // Generate or propagate a Trace ID
+    traceID := "a1b2c3d4e5" 
+    spanID := "f6g7h8"
+
+    props := &paho.PublishProperties{
+        User: []paho.UserProperty{
+            {Key: "traceparent", Value: fmt.Sprintf("00-%s-%s-01", traceID, spanID)},
+            {Key: "content-type", Value: "application/json"},
+            {Key: "origin-region", Value: "us-east-1"},
+        },
+    }
+
+    cm.Publish(ctx, &paho.Publish{
+        Topic:      topic,
+        Payload:    payload,
+        Properties: props,
+    })
+}
+```
+
+#### Reading Properties (The Subscriber)
+
+In your Go handler (`OnPublishReceived`), you access these properties directly without touching the payload.
+```go
+func handleMessage(pr paho.PublishReceived) (bool, error) {
+    // Access User Properties map
+    // Note: paho.UserProperty is a slice, not a map (keys can duplicate)
+    var region string
+    for _, prop := range pr.Packet.Properties.User {
+        if prop.Key == "origin-region" {
+            region = prop.Value
+        }
+    }
+
+    // Routing Logic based on Header (Fast!)
+    if region == "eu-west-1" {
+        // Send to GDPR handler
+    }
+
+    return true, nil
+}
+```
+
+### 6.3. Request-Response Pattern
+
+MQTT is asynchronous. Usually, this is a feature. But sometimes, you need to ask a device a question and get an answer: "What is your current firmware version?" or "Open the door now."
+
+In the past, developers hacked this by manually subscribing to `cmd/response/{deviceID}`. This required hardcoding topic names on both sides and created tight coupling.
+
+MQTT 5.0 formalizes this with two specific header properties:
+1. **ResponseTopic**: "Please send the reply here."
+2. **CorrelationData**: "Include this ID in the reply so I know which request you are answering."
+
+#### Implementing RPC over MQTT in Go
+**The Requester (Cloud Service)**: We create a temporary subscription to receive the answer, then send the command.
+```go
+func SendCommand(ctx context.Context, cm *autopaho.ConnectionManager, deviceID string) {
+    replyTopic := "replies/service-01"
+    correlationID := []byte(uuid.NewString()) // Unique Request ID
+
+    // 1. Ensure we are subscribed to the reply topic
+    // (In prod, do this once at startup, not per request)
+    cm.Subscribe(ctx, &paho.Subscribe{
+        Subscriptions: map[string]paho.SubscribeOptions{replyTopic: {QoS: 1}},
+    })
+
+    // 2. Publish the Command
+    cm.Publish(ctx, &paho.Publish{
+        Topic:   "devices/" + deviceID + "/cmd/get_status",
+        Payload: []byte{},
+        Properties: &paho.PublishProperties{
+            ResponseTopic:   replyTopic,
+            CorrelationData: correlationID,
+        },
+    })
+
+    // 3. Store the correlationID in a map to await the response
+    // (Pseudo-code: requestMap.Store(string(correlationID), callback))
+}
+```
+
+**The Responder (Edge Device)**: The device (or other Go service) receives the command, processes it, and replies exactly where instructed.
+```go
+func onCommandReceived(pr paho.PublishReceived) (bool, error) {
+    // 1. Do the work
+    status := []byte(`{"firmware": "2.1.0"}`)
+
+    // 2. Prepare the Reply
+    // We MUST mirror the CorrelationData back to the sender
+    replyProps := &paho.PublishProperties{
+        CorrelationData: pr.Packet.Properties.CorrelationData,
+    }
+
+    // 3. Publish to the requested ResponseTopic
+    // Note: Always check if ResponseTopic is present!
+    if pr.Packet.Properties.ResponseTopic != "" {
+        publishReply(
+            pr.Packet.Properties.ResponseTopic, 
+            status, 
+            replyProps,
+        )
+    }
+    
+    return true, nil
+}
+```
+
+#### The Go Advantage
+
+By implementing Request-Response this way, your Go services become **stateless**. The "Routing" information is carried in the message itself. You can change the reply topic dynamically (e.g. to point to a specific debugging queue) without redeploying the edge devices.
+
 
 ## Section 7: Hardening: Security & Reliability
 
