@@ -1271,7 +1271,190 @@ The `GOGC` environment variable controls the aggressiveness of the garbage colle
 
 ## Section 9: Case Study: "Smart Logistics" Tracking System
 
-(TODO: nick-we)
+Theory is necessary, but context is king. To cement the concepts of Concurrency, QoS, and Resilience we have discussed, we will now architect a complete system for a high-stakes, real-world scenario.
+
+We are building the telemetry backbone for **Global Logistics Corp**, a hypothetical cold-chain transport company.
+
+### 9.1. The Scenario: Cold Chain Integrity
+
+#### The Scale:
+- **Fleet**: 10,000 Refrigerated Trucks.
+- **Telemetry**: GPS Location, Cargo Temperature, Fuel Level, Speed.
+- **Frequency**: Every 5 seconds (critical for temperature compliance).
+- **Volume**: 10,000 devices $\times$ 12 messages/min $\times$ 60 min = *7.2 Million messages/hour*.
+
+#### The Constraints:
+- **Network Hostility**: Trucks drive through tunnels, rural dead zones, and cross borders where cellular roaming fails. Connectivity is the exception, not the norm.
+- **Data Integrity**: We cannot lose temperature data. If a pharmaceutical cargo spoils because the AC failed in a tunnel, we need the forensic data to prove exactly when it happened.
+- **Latency**: When a truck enters a "Geofence" (e.g. arriving at a warehouse), the notification to the warehouse manager must be near-instant.
+
+### 9.2. The Architecture
+
+We will adopt an **Edge-Native** approach using Go on both ends of the wire.
+
+1. **The Edge (The Truck)**: An industrial gateway (ARM64) running a compiled Go binary. It acts as a "Store-and-Forward" engine. It does not rely on the MQTT client's internal memory buffer (which is volatile); it uses a local disk buffer.
+2. **The Broker**: A clustered HiveMQ or EMQX setup, exposed via TLS on Port 8883.
+3. **The Backend (The Cloud)**: A Go microservice deployed on Kubernetes, utilizing *Shared Subscriptions* to shard the 10,000-truck load across 5 Pods.
+
+### 9.3. The Edge Client: Store-and-Forward Logic
+
+The standard Paho library buffers messages in RAM. If the truck loses power, that data is gone. We need a robust "Offline Mode."
+
+#### The "Look-Aside" Buffer Pattern
+Our Go client wraps the MQTT publisher. Before publishing, it checks connection status.
+- **Connected**: Send immediately.
+- **Disconnected**: Serialize the data and append it to a local *BoltDB* (a pure Go key/value store) or a write-ahead log file.
+
+```go
+// The Telemetry Struct
+type TruckData struct {
+    TruckID   string  `json:"id"`
+    Timestamp int64   `json:"ts"`
+    Lat       float64 `json:"lat"`
+    Lon       float64 `json:"lon"`
+    Temp      float64 `json:"temp"`
+}
+
+// The Edge Publisher
+func (e *EdgeClient) PublishTelemetry(data TruckData) error {
+    payload, _ := json.Marshal(data)
+
+    // 1. Check Connection State (Atomic check)
+    if e.mqttManager.IsConnected() {
+        // Try to send (QoS 1)
+        // If this fails immediately, we fall through to buffering
+        ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+        defer cancel()
+        
+        _, err := e.mqttManager.Publish(ctx, &paho.Publish{
+            Topic:   "telemetry/trucks/" + data.TruckID,
+            Payload: payload,
+            QoS:     1,
+        })
+        
+        if err == nil {
+            return nil // Success
+        }
+    }
+
+    // 2. Fallback: Write to Local Disk (BoltDB)
+    // This survives power loss and application restarts.
+    log.Warn("Offline. Buffering to disk.", "id", data.TruckID)
+    return e.localBuffer.Save(data.Timestamp, payload)
+}
+```
+
+#### The "Flush" Goroutine
+
+When the truck exits the tunnel and 4G returns, we cannot just dump 2 hours of data (1,440 messages) onto the socket instantly. That would block the control loop. We run a background "Flusher."
+
+```go
+func (e *EdgeClient) StartFlusher(ctx context.Context) {
+    ticker := time.NewTicker(5 * time.Second)
+    for {
+        select {
+        case <-ticker.C:
+            if e.mqttManager.IsConnected() {
+                // Retrieve oldest 50 records (FIFO)
+                batch := e.localBuffer.Peek(50) 
+                if len(batch) == 0 {
+                    continue
+                }
+                
+                // Transmit
+                for _, item := range batch {
+                    // Publish logic...
+                }
+                
+                // Only delete from disk after successful Publish
+                e.localBuffer.Delete(batch)
+            }
+        case <-ctx.Done():
+            return
+        }
+    }
+}
+```
+
+### 9.4. The Backend: Geofence Worker Pool
+
+On the server side, we face the "Thundering Herd." When a cellular tower repairs itself, 500 trucks might reconnect simultaneously, flushing their buffers. Our Ingestion Service must handle this spikes without crashing the database.
+
+#### Shared Subscription Implementation
+We deploy 5 replicas of our Go service. They all join the group `$share/logistics-group/telemetry/trucks/#`. The broker distributes the load. If Truck A sends a burst of 100 messages, they all route to one consumer (usually), maintaining order sequence per client (depending on broker hashing strategy).
+
+#### The Point-in-Polygon Worker
+We need to check if the truck is inside a "Geofence" (e.g., the London Distribution Center). This is CPU-intensive math. We use the **Worker Pool** pattern from Section 5.
+
+```go
+func (s *IngestionService) ProcessMessage(msg *paho.Publish) {
+    // 1. Parse
+    var data TruckData
+    if err := json.Unmarshal(msg.Payload, &data); err != nil {
+        return
+    }
+
+    // 2. Fan-Out to Geofence Worker
+    // Do not block the MQTT consumer!
+    select {
+    case s.geoWorkerQueue <- data:
+        // Queued successfully
+    default:
+        // Metric: specific_drop_count_inc("geofence_queue")
+        log.Error("Geofence queue full, dropping calculation (data saved to DB via other path)")
+    }
+
+    // 3. Fan-Out to Database Batcher (Critical Data)
+    // This usually has a larger buffer because we cannot lose data.
+    s.dbBatcherQueue <- data
+}
+
+// The CPU-Bound Worker
+func geofenceWorker(input <-chan TruckData) {
+    for data := range input {
+        // Ray Casting Algorithm to check if point is in polygon
+        if IsInside(data.Lat, data.Lon, LondonWarehousePoly) {
+            triggerArrivalEvent(data.TruckID)
+        }
+    }
+}
+```
+
+### 9.5. Handling the "Tunnel Effect" (Batching Strategy)
+
+There is a hidden optimization here. If a truck has been offline for 2 hours, sending 1,440 individual MQTT packets is inefficient (1,440 headers, 1,440 TCP syscalls).
+
+**The Optimization**: The Edge Client should inspect its buffer. If it has >10 items, it should bundle them into a single **Compressed Batch Payload**.
+- **Topic**: `telemetry/trucks/{id}/batch`
+- **Payload**: Gzipped JSON Array `[{},{},...]`
+
+The Go Backend detects the topic suffix `/batch`:
+```go
+func handleMessage(msg *paho.Publish) {
+    if strings.HasSuffix(msg.Topic, "/batch") {
+        // 1. Decompress Gzip
+        // 2. Unmarshal Array
+        // 3. Loop and process individual points
+    } else {
+        // Process single point
+    }
+}
+```
+
+This reduces network overhead by ~90% during recovery phases, a massive cost saving on cellular data plans.
+
+### 9.6. Results and Observability
+By implementing this architecture for Global Logistics Corp, we achieve:
+1. **Zero Data Loss**: The BoltDB buffer captures every temperature reading, even during total power failure.
+2. **Elastic Scalability**: The Shared Subscription model allows us to scale from 10k to 100k trucks simply by increasing the Kubernetes `replicas` count.
+3. **Cost Efficiency**: Batching compressed data minimizes the byte-count on expensive satellite/roaming links.
+
+We monitor this system using **Prometheus**. Key Go metrics to expose:
+- `mqtt_ingress_messages_total` (Counter)
+- `worker_pool_saturation` (Gauge: 0.0 to 1.0)
+- `edge_buffer_depth` (Reported via telemetry payload)
+
+This case study demonstrates that "connecting" devices is easy, but "engineering" a system requires anticipating failure at every layer of the stack.
 
 ## Section 10: Conclusion & Future Outlook
 
