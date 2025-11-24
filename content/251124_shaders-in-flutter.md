@@ -229,9 +229,152 @@ shader.setImageSampler(1, noiseTexture);
 **Pro Tip**: Always resolve your `ui.Image` objects before the `paint()` phase. Resolving an AssetBundle image into a `ui.Image` is an asynchronous operation. Do not `await` inside `CustomPainter.paint`.
 {{< /callout >}}
 
-## 3. Building the Rendering Engine: The "Canvas"
+## 3. The Rendering Engine Architecture
 
-(TODO nick-we: write this section)
+If the shader is the "brain" of your photo editor, the **Rendering Engine** is the nervous system. It is responsible for orchestrating the flow of data, managing the coordinate space, and determining exactly when and where pixels are drawn.
+
+Many developers make the mistake of treating a photo editor like a standard UI screen, stacking widgets and hoping for the best. However, building a high-fidelity editor like Prequel requires abandoning the widget tree for the actual rendering pipeline. We are not building a generic layout; we are building a viewport.
+
+This section details the architecture of that viewport, focusing on the transition from standard Flutter widgets to a managed `CustomPainter` pipeline, the mathematics of coordinate normalization, and the complexities of multi-pass rendering.
+
+### 3.1. The `CustomPainter` Approach
+
+In the Flutter ecosystem, the `ShaderMask` widget is often the first tool developers reach for when applying visual effects. It is convenient, declarative, and works well for simple tasks like applying a gradient to text or greyscaling an icon.
+
+**For a professional photo editor, `ShaderMask` is a dead end.**
+
+The `ShaderMask` widget abstracts away the painting context, stripping you of the control required for complex image processing. It assumes a single pass, offers limited control over the drawing rectangle, and tightly couples the effect to the widget hierarchy.
+
+**Why We Drop to `CustomPainter`**
+
+To achieve 60fps performance with complex, layered effects, we must descend one level deeper to the `CustomPainter`. This class gives us direct access to the `Canvas` object and the `Paint` method, allowing us to:
+
+1. **Control the Draw Order**: We can manually sequence the rendering layers—drawing the background image, then the filter pass, then the grain overlay, and finally the vector UI guides—all within a single paint cycle.
+2. **Explicit Rect Management**: We can define exactly where the shader paints, independent of the screen size. This is critical for maintaining aspect ratios and handling zoom/pan gestures.
+3. **Minimize Overhead**: CustomPainter avoids the overhead of the widget element tree for every frame update. When a uniform changes (e.g., grain intensity), we trigger a repaint of the painter, not a rebuild of a widget subtree.
+
+**The `paint()` Method Anatomy**
+The heart of your engine lies in the `paint()` method. Here, you bind your compiled shader to the `Paint` object and execute the draw command.
+```dart
+@override
+void paint(Canvas canvas, Size size) {
+  // 1. Configure the Shader
+  // Pass uniforms: resolution, time, intensity, etc.
+  shader.setFloat(0, size.width);
+  shader.setFloat(1, size.height);
+  shader.setImageSampler(0, inputImage);
+  
+  // 2. Bind to Paint
+  final paint = Paint()..shader = shader;
+  
+  // 3. Execute the Draw Command
+  // We draw a rectangle that covers the entire canvas.
+  // The shader 'fills' this rectangle based on its logic.
+  canvas.drawRect(
+    Rect.fromLTWH(0, 0, size.width, size.height),
+    paint,
+  );
+}
+```
+
+This structure separates the logic (the shader) from the geometry (the `Rect`). Even if your image is circular or has complex transparency, you almost always draw a full-screen rectangle (`drawRect`) and let the shader handle the alpha channels and masking mathematically.
+
+### 3.2. Coordinate Space Normalization
+
+One of the most notoriously difficult aspects of shader programming is bridging the gap between **Screen Coordinates** (pixels) and **Texture Coordinates** (0.0 to 1.0 UVs).
+
+If you blindly pass texture coordinates to a shader without accounting for aspect ratios, your circular vignettes will become ovals, and your square distortions will stretch. This happens because the UV space is always a square (0 to 1), but your device screen—and your source photo—are rarely 1:1 squares.
+
+**The Aspect Ratio Formula**
+
+To render shapes correctly, you must correct the UV coordinates inside the shader. The goal is to make the coordinate space "aware" of the image dimensions. The golden formula for UV correction in a fragment shader is:
+
+$$uv = (uv - 0.5) * aspect + 0.5$$
+
+**How it works:**
+1. **uv - 0.5:** We shift the coordinate system so that `(0, 0)` is at the center of the image, rather than the top-left. This allows us to scale relative to the center.
+2. **aspect:** We multiply one axis (usually X) by the aspect ratio ($width / height$). This compresses or expands the coordinate space to match the physical dimensions of the image.
+3. **+ 0.5:** We shift the system back so `(0, 0)` returns to the corner, restoring standard UV mapping but with corrected proportions.
+
+In your Dart `CustomPainter`, you must calculate this ratio and pass it as a uniform:
+```dart
+// Dart
+double aspectRatio = size.width / size.height;
+shader.setFloat(uIndexAspectRatio, aspectRatio);
+```
+
+**Zoom, Pan, and the Virtual Viewport**
+
+A "Prequel-style" editor allows users to pinch-to-zoom and drag the image. In a naive implementation, you might use a `Transform.scale` widget. However, this pixelates the render because it scales the result of the shader.
+
+**The Pro Approach**: You must scale the coordinate space fed into the shader.
+
+We utilize a `Matrix4` to track the user's viewport. When the user pinches, we update the matrix. Inside `paint()`, we invert this matrix to determine which part of the texture should be visible.
+
+Zooming In: We are actually "zooming in" on the UV coordinates. A zoom level of 2x means the shader samples UVs from 0.25 to 0.75 instead of 0.0 to 1.0.
+
+Panning: We apply an offset to the UVs before sampling the texture.
+
+This technique ensures that procedural effects (like grain or noise) remain crisp regardless of the zoom level, because they are being recalculated for the new coordinate space, not simply stretched.
+
+**Handling Retina (DPR)**
+
+Finally, Flutter deals in logical pixels, but `gl_FragCoord` in a shader deals in physical device pixels. On an iPhone 16 Pro, the device pixel ratio (DPR) is 3.0.
+
+If you pass `size.width` (logical) to a shader expecting physical resolution, your effects will be off by a factor of `3`.
+- Rule: Always multiply your canvas size by `MediaQuery.of(context).devicePixelRatio` when passing resolution uniforms to the shader.
+
+### 3.3. The Pipeline: Chaining Shaders (Multi-Pass Rendering)
+
+The single greatest limitation of a Fragment Shader is that it is **memoryless**. A pixel being processed cannot see the output of its neighbor, nor can it read the result of its own previous frame.
+
+This poses a problem for complex effects. For example, a "Bloom" effect requires:
+
+- Pass 1: Isolate bright pixels (Thresholding).
+
+- Pass 2: Blur the bright pixels horizontally.
+
+- Pass 3: Blur the vertical results of Pass 2.
+
+- Pass 4: Composite the blur on top of the original image.
+
+You cannot do this in one `.frag` file. You need a Multi-Pass Pipeline.
+
+**The "Ping-Pong" Technique**
+
+
+To chain shaders in Flutter, we must use an intermediate buffer. Since we cannot write directly to a texture, we use a `PictureRecorder` to render a shader to an off-screen `Canvas`, which we then convert into an `Image` to feed into the next shader.
+This is often called "Ping-Ponging" because we swap input and output buffers:
+
+1. Source Image $\rightarrow$ Blur Shader $\rightarrow$ Buffer A
+2. Buffer A $\rightarrow$ Noise Shader $\rightarrow$ Buffer B
+3. Buffer B $\rightarrow$ Color Grade $\rightarrow$ Screen
+
+**Implementing the Buffer**
+
+In Dart, this looks like rendering a snapshot:
+```dart
+ui.Image renderIntermediatePass(Shader shader, Size size) {
+  final recorder = ui.PictureRecorder();
+  final canvas = Canvas(recorder);
+  
+  final paint = Paint()..shader = shader;
+  canvas.drawRect(Rect.fromLTWH(0, 0, size.width, size.height), paint);
+  
+  final picture = recorder.endRecording();
+  // 'toImage' creates a texture we can use in the next pass
+  return picture.toImageSync(size.width.toInt(), size.height.toInt()); 
+}
+```
+
+**Performance Warning**
+While powerful, multi-pass rendering is heavy. Every time you call `toImage` (or `toImageSync` in newer Impeller versions), you are allocating memory and potentially stalling the pipeline.
+
+**Optimization Strategies:**
+- **Merge Shaders**: Whenever mathematically possible, combine effects into a single "Mega-Shader." Color grading, grain, and vignette can usually be done in one pass.
+- **Downsample Buffers**: For effects like Bloom or Blur, you do not need full resolution. Render the intermediate passes at 50% or 25% scale. This reduces the number of pixels the GPU has to process by 4x or 16x, significantly speeding up the "Ping-Pong" cycle without noticeable quality loss.
+
+By mastering the `CustomPainter`, controlling the coordinate math, and architecting a robust multi-pass pipeline, you effectively build a mini game engine dedicated to image processing. This is the foundation upon which the aesthetic magic of the next section is built.
 
 ## 4. Implementing Aesthetic Filters (The "Prequel" Look)
 
