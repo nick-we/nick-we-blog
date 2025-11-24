@@ -99,7 +99,135 @@ With the engine (Impeller) ready, the business case validated, and the toolchain
 
 ## 2. Core Shader Concepts for Dart Developers
 
-(TODO nick-we: write this section)
+In the world of standard Flutter development, you are an imperative commander. You tell the framework: *"Draw a Container here. Now animate it to the right."* You control the flow.
+
+In the world of Shaders, you are a **declarative** architect. You do not tell the GPU how to draw the image step-by-step. Instead, you write a mathematical law, a function, that defines the color of a single pixel based on its position. The GPU then applies this law to 2 million pixels simultaneously, 60 times a second.
+
+This section bridges the mental gap between Dart (CPU) and GLSL (GPU), establishing the foundational concepts required to build a Prequel-grade editor.
+
+### 2.1. The Anatomy of a Fragment Shader
+The transition from Dart to GLSL (OpenGL Shading Language) requires a shift in thinking from loops to parallelism.
+
+**Pixel-Parallel Processing**
+
+Imagine you are painting a 1920x1080 image.
+
+- **CPU Approach (Dart)**: You would write a `for` loop that iterates 2,073,600 times, calculating the color for pixel `[0,0]`, then `[0,1]`, and so on. This is sequential and slow.
+- **GPU Approach (Shader)**: The GPU spawns thousands of tiny "threads" (invocations). Each thread asks: *"I am pixel [X,Y]. What color should I be?"*
+
+There is no state shared between these pixels. Pixel A cannot know what color Pixel B is calculating. This restriction is what allows the massive parallelism (SIMD: Single Instruction, Multiple Data) that makes 60fps real-time filtering possible.
+
+**Coordinate Systems (The UV Space)**
+
+In Flutter CustomPainter, we deal with logical pixels (e.g. `Offset(150, 300)`). In GLSL, we deal with **Normalized Device Coordinates (UVs)**.
+- **Normalization**: Coordinates are almost always mapped from `0.0` to `1.0`.
+    - `vec2(0.0, 0.0)` is the Top-Left (usually).
+    - `vec2(1.0, 1.0)` is the Bottom-Right.
+    - `vec2(0.5, 0.5)` is the exact center.
+
+**Crucial Math**: To convert a Flutter pixel position to a UV coordinate in the shader, you divide the pixel position by the canvas size:
+
+$$uv = \frac{fragCoord}{uResolution}$$
+
+**Visualizing the Output**: The entry point of every shader is `void main()`. Its only job is to assign a value to `fragColor`.
+```glsl
+// A simple shader that turns the screen red
+out vec4 fragColor; // The output variable
+
+void main() {
+    // R, G, B, Alpha (0.0 to 1.0)
+    fragColor = vec4(1.0, 0.0, 0.0, 1.0);
+}
+```
+
+### 2.2. Loading Shaders in Flutter (2025 Workflow)
+
+Gone are the days of hacking shaders into string literals. Modern Flutter uses the typed `FragmentProgram` API, which relies on the engine's ability to compile SPIR-V binaries.
+
+**The `FragmentProgram` Async Pattern**
+
+Shaders must be loaded asynchronously because the engine needs to move the compiled binary from the asset bundle into GPU memory.
+
+**1. Define in `pubspec.yaml`:**
+```yaml
+flutter:
+  shaders:
+    - shaders/filters/grain.frag
+```
+
+**2. Load in Dart:**
+```dart
+// Load the compiled program (SPIR-V)
+final program = await FragmentProgram.fromAsset('shaders/filters/grain.frag');
+
+// Create a shader instance (Draw-time object)
+final shader = program.fragmentShader();
+```
+
+**Hot Reloading: The "Hard Truth"**
+
+This is the single biggest friction point for developers new to graphics.
+
+- **Dart Hot Reload**: Updates your widget tree and logic instantly.
+- **Shader Hot Reload**: Does not happen automatically with a standard `r`.
+- 
+Because shaders are pre-compiled by Impeller (AOT) or the SkSL compiler, changing the code inside a `.frag` file usually requires a **Hot Restart** (`R`) or a full re-initialization of the `FragmentProgram`.
+
+**Table 2.1: Shader Development Workflows**
+
+| Strategy           | Speed        | Pros                                                                                 | Cons                                                                          |
+| ------------------ | ------------ | ------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------- |
+| Native Hot Restart | Slow (~1-2s) | No extra tools needed. 100% accurate to production behavior.                         | Breaks flow. Resets app state (navigation/forms).                             |
+| Vscode GLSL Canvas | Instant      | Previews shader logic in a standalone window inside VS Code.                         | Isolated from Flutter. Can't see real app uniforms/images.                    |
+| Watcher Script     | Fast         | A custom script that watches `.frag` files and triggers a hot restart automatically. | Requires setting up a file-watcher script (e.g., using `fvm` or simple bash). |
+
+{{< callout type="info" >}}
+*Recommendation*: Use the **VS Code "Shader languages support"** extension with the **glsl-canvas** plugin to prototype your math (gradients, noise, SDFs). Once the visual look is 90% there, move to Flutter for the integration.
+{{< /callout >}}
+
+### 2.3. Uniforms: The Bridge Data
+
+If the shader is the engine, Uniforms are the fuel. They are the variables you pass from Dart (CPU) to GLSL (GPU). These values are "uniform" (constant) across every pixel for that specific frame.
+
+**Types & Memory Alignment**
+
+Bridging the two languages requires strict data mapping. Flutter's `FragmentShader` API uses flat index-based setters (`setFloat`, `setImageSampler`), which abstracts some complexity, but you must still respect GLSL's memory layout.
+
+**The Indexing Rule**: Every `float` counts as 1 index. A `vec3` counts as 3 indices. A `vec4` counts as 4 indices.
+
+| GLSL Type   | Dart Equivalent         | Indices Consumed | Code Example                                          |
+| ----------- | ----------------------- | ---------------- | ----------------------------------------------------- |
+| `float`     | `double`                | 1                | `shader.setFloat(0, 0.5);`                            |
+| `vec2`      | `Offset` / `Size`       | 2                | `shader.setFloat(1, w); shader.setFloat(2, h);`       |
+| `vec3`      | `Vector3` (vector_math) | 3                | *See warning below*                                   |
+| `vec4`      | `Color` / `Rect`        | 4                | `shader.setFloat(10, r); ... shader.setFloat(13, a);` |
+| `sampler2D` | `ui.Image`              | Special          | `shader.setImageSampler(0, image);`                   |
+
+**CRITICAL WARNING: The `vec3` Alignment Trap**
+
+In strict GLSL memory layouts (like `std140`, used in Uniform Buffer Objects), a `vec3` is often padded to take up the space of a `vec4` (16 bytes).
+
+While Flutter's `setFloat` API allows you to pack floats tightly (index 0, 1, 2, 3...), Impeller's underlying buffer may expect alignment padding depending on how the shader was compiled.
+
+- **Best Practice**: Avoid `vec3` in your shader definitions if possible. Use `vec4` and ignore the 4th component, or be meticulously careful with your index tracking.
+- **The "Floats List" Optimization**: Instead of calling `setFloat` 20 times (which crosses the FFI bridge 20 times), efficient rendering engines use a `Float32List` to set all uniforms in a batch if the API permits, or manage them in a tightly packed data structure in Dart.
+
+**Handling Textures (`sampler2D`)**
+
+Textures are not passed via `setFloat`. They are bound to specific "Texture Units".
+```dart
+// GLSL
+uniform sampler2D uImage; // Texture Unit 0
+uniform sampler2D uNoise; // Texture Unit 1
+
+// Dart
+shader.setImageSampler(0, mainImage);
+shader.setImageSampler(1, noiseTexture);
+```
+
+{{< callout type="info" >}}
+**Pro Tip**: Always resolve your `ui.Image` objects before the `paint()` phase. Resolving an AssetBundle image into a `ui.Image` is an asynchronous operation. Do not `await` inside `CustomPainter.paint`.
+{{< /callout >}}
 
 ## 3. Building the Rendering Engine: The "Canvas"
 
